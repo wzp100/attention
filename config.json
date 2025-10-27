@@ -1,10 +1,10 @@
 {
-  "message": "暂无任务",
+  "message": "修复程序bug",
   "x": 691,
   "y": 17,
   "font_family": "Segoe UI",
   "font_size": 18,
-  "text_color": "#ffffff",
+  "text_color": "#ff3b30",
   "outline_color": "#000000",
   "transparency": 1.0,
   "language": "zh"
