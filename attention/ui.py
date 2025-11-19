@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import sys
+try:
+    import winreg  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - non-Windows
+    winreg = None  # type: ignore[assignment]
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -22,6 +28,7 @@ from .config import (
     ensure_color,
     ensure_font_size,
     ensure_language,
+    ensure_schedule,
     ensure_transparency,
     is_valid_color,
 )
@@ -96,6 +103,24 @@ class TaskApp:
         self.history_combobox: ttk.Combobox | None = None
         self.history_close_button: tk.Button | None = None
         self.history_date_label: tk.Label | None = None
+        self.schedule = [dict(entry) for entry in config.schedule]
+        self.schedule_window: tk.Toplevel | None = None
+        self.schedule_listbox: tk.Listbox | None = None
+        self.schedule_add_button: tk.Button | None = None
+        self.schedule_edit_button: tk.Button | None = None
+        self.schedule_delete_button: tk.Button | None = None
+        self.schedule_overlay: tk.Toplevel | None = None
+        self._schedule_overlay_time_label: tk.Label | None = None
+        self._schedule_overlay_current_label: tk.Label | None = None
+        self._schedule_overlay_schedule_label: tk.Label | None = None
+        self._schedule_overlay_time_font: tkfont.Font | None = None
+        self._schedule_overlay_current_font: tkfont.Font | None = None
+        self._schedule_overlay_schedule_font: tkfont.Font | None = None
+        self._active_schedule_marker: tuple[str, str] | None = None
+        self._schedule_check_job: str | None = None
+        self._last_schedule_lock: tuple[str, str, str] | None = None
+        self._last_schedule_lock_timestamp: datetime | None = None
+        self._lock_fail_notified = False
         self.text_font = tkfont.Font(
             family=self.font_family,
             size=self.font_size,
@@ -106,6 +131,12 @@ class TaskApp:
             size=max(10, self.font_size - 6),
             weight="normal",
         )
+        self.small_font = tkfont.Font(
+            family=self.font_family,
+            size=max(8, self.font_size - 8),
+            weight="normal",
+        )
+        self._estimate_minutes: int | None = None
 
         self.canvas = tk.Canvas(
             self.root,
@@ -135,6 +166,7 @@ class TaskApp:
         self._redraw_text()
         self._apply_geometry()
         self._time_job = self.root.after(1000, self._update_time_display)
+        self._start_schedule_monitor()
 
     def _t(self, key: str, **kwargs) -> str:
         return translate(self.language, key, **kwargs)
@@ -144,6 +176,7 @@ class TaskApp:
         text = self.message or " "
         time_text = self._format_time_text()
         self._current_time_text = time_text
+        estimate_text, estimate_color = self._format_estimate_text()
 
         temp_id = self.canvas.create_text(
             0,
@@ -184,9 +217,32 @@ class TaskApp:
                 time_width = time_bbox[2] - time_bbox[0]
                 time_height = time_bbox[3] - time_bbox[1]
 
-        content_width = max(text_width, time_width)
+        est_width = 0
+        est_height = 0
+        if estimate_text:
+            temp_est_id = self.canvas.create_text(
+                0,
+                0,
+                text=estimate_text,
+                font=self.small_font,
+                width=WRAP_LENGTH,
+                anchor="nw",
+                justify="center",
+            )
+            est_bbox = self.canvas.bbox(temp_est_id)
+            self.canvas.delete(temp_est_id)
+            if est_bbox:
+                est_width = est_bbox[2] - est_bbox[0]
+                est_height = est_bbox[3] - est_bbox[1]
+
+        content_width = max(text_width, time_width, est_width)
         width = max(content_width + PADDING * 2, 200)
-        height = text_height + (TIME_GAP + time_height if time_text else 0) + PADDING * 2
+        blocks_height = text_height
+        if time_text:
+            blocks_height += TIME_GAP + time_height
+        if estimate_text:
+            blocks_height += TIME_GAP + est_height
+        height = blocks_height + PADDING * 2
         height = max(height, 60)
         self.canvas.config(width=width, height=height)
 
@@ -202,16 +258,26 @@ class TaskApp:
             self.outline_color,
         )
 
+        next_y = text_center_y + text_height / 2
         if time_text:
-            time_center_y = (
-                text_center_y + text_height / 2 + TIME_GAP + time_height / 2
-            )
+            time_center_y = next_y + TIME_GAP + time_height / 2
             self._draw_text_with_outline(
                 center_x,
                 time_center_y,
                 time_text,
                 self.time_font,
                 TIME_TEXT_COLOR,
+                self.outline_color,
+            )
+            next_y = time_center_y + time_height / 2
+        if estimate_text:
+            est_center_y = next_y + TIME_GAP + est_height / 2
+            self._draw_text_with_outline(
+                center_x,
+                est_center_y,
+                estimate_text,
+                self.small_font,
+                estimate_color,
                 self.outline_color,
             )
         self.root.update_idletasks()
@@ -252,6 +318,22 @@ class TaskApp:
             width=WRAP_LENGTH,
             anchor="center",
         )
+
+    @staticmethod
+    def _normalize_time_string(value: str) -> str | None:
+        try:
+            dt = datetime.strptime(value.strip(), "%H:%M")
+            return dt.strftime("%H:%M")
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _time_to_minutes(value: str) -> int | None:
+        try:
+            dt = datetime.strptime(value, "%H:%M")
+            return dt.hour * 60 + dt.minute
+        except ValueError:
+            return None
 
     def _apply_geometry(self) -> None:
         self.root.update_idletasks()
@@ -326,6 +408,9 @@ class TaskApp:
                 self._t("error_empty"),
             )
             return
+        if not self.task_active and not self.paused and self.base_message in NO_TASK_VALUES:
+            self._activate_task(new_text)
+            return
         if self.paused:
             self.base_message = new_text
             paused_message = f"{self._t('pause_prefix')} {self.base_message}"
@@ -343,32 +428,87 @@ class TaskApp:
             self.context_menu.grab_release()
 
     def start_task(self) -> None:
-        prompt = simpledialog.askstring(
-            self._t("prompt_start_title"),
-            self._t("prompt_start_message"),
-            initialvalue=""
-            if not self.base_message or self.base_message in NO_TASK_VALUES
-            else self.base_message,
-            parent=self.root,
-        )
-        if prompt is None:
+        result = self._prompt_start_with_estimate()
+        if result is None:
             return
-        task_name = prompt.strip()
+        task_name, est_minutes = result
+        self._activate_task(task_name, estimate_minutes=est_minutes)
+
+    def _prompt_start_with_estimate(self) -> tuple[str, int | None] | None:
+        title = self._t("prompt_start_title")
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        frm = tk.Frame(dialog, padx=12, pady=12)
+        frm.pack(fill="both", expand=True)
+        # Task name
+        tk.Label(frm, text=self._t("prompt_start_message")).grid(row=0, column=0, sticky="w")
+        task_var = tk.StringVar(value=("" if not self.base_message or self.base_message in NO_TASK_VALUES else self.base_message))
+        task_entry = tk.Entry(frm, textvariable=task_var, width=40)
+        task_entry.grid(row=1, column=0, sticky="we", pady=(4, 8))
+        # Estimate (optional)
+        tk.Label(frm, text=self._t("prompt_estimate_message")).grid(row=2, column=0, sticky="w")
+        est_var = tk.StringVar(value="")
+        est_entry = tk.Entry(frm, textvariable=est_var, width=20)
+        est_entry.grid(row=3, column=0, sticky="w", pady=(4, 8))
+        # Buttons
+        btns = tk.Frame(frm)
+        btns.grid(row=4, column=0, sticky="e")
+        result: list | None = []
+
+        def on_ok() -> None:
+            name = task_var.get().strip()
+            if not name:
+                messagebox.showerror(self._t("notice_title"), self._t("error_empty"), parent=dialog)
+                return
+            est_raw = est_var.get().strip()
+            minutes: int | None = None
+            if est_raw:
+                try:
+                    v = int(est_raw)
+                    if v > 0:
+                        minutes = v
+                except ValueError:
+                    # Invalid input: ignore and treat as optional empty
+                    minutes = None
+            nonlocal_result[0] = (name, minutes)
+            dialog.destroy()
+
+        def on_cancel() -> None:
+            nonlocal_result.clear()
+            dialog.destroy()
+
+        nonlocal_result: list = [None]  # type: ignore[var-annotated]
+        ok_btn = tk.Button(btns, text=self._t("button_save"), width=10, command=on_ok)
+        ok_btn.pack(side="left", padx=4)
+        cancel_btn = tk.Button(btns, text=self._t("button_cancel"), width=10, command=on_cancel)
+        cancel_btn.pack(side="left", padx=4)
+        dialog.bind("<Return>", lambda _e: on_ok())
+        dialog.bind("<Escape>", lambda _e: on_cancel())
+        task_entry.focus_set()
+        dialog.wait_window()
+        if not nonlocal_result:
+            return None
+        return nonlocal_result[0]  # type: ignore[return-value]
+
+    def _activate_task(self, task_name: str, record_event: bool = True, estimate_minutes: int | None = None) -> None:
+        task_name = task_name.strip()
         if not task_name:
-            messagebox.showerror(
-                self._t("notice_title"),
-                self._t("error_empty"),
-            )
             return
         self.task_active = True
         self.paused = False
         self.start_time = datetime.now()
         self.elapsed_before_pause = timedelta()
         self.base_message = task_name
+        self._estimate_minutes = estimate_minutes
         self.text_color = ACTIVE_TEXT_COLOR
         self.config.text_color = self.text_color
         self.set_message(task_name)
-        self._record_event("start", task_name)
+        if record_event:
+            self._record_event("start", task_name)
         self._update_pause_controls()
         self._trigger_time_update()
 
@@ -407,6 +547,7 @@ class TaskApp:
         self.start_time = None
         self.elapsed_before_pause = timedelta()
         self.base_message = self._t("no_task")
+        self._estimate_minutes = None
         self.text_color = STOP_TEXT_COLOR
         self.config.text_color = self.text_color
         self.set_message(self.base_message)
@@ -491,6 +632,510 @@ class TaskApp:
                 self.context_menu_pause_index, label=self._current_pause_label()
             )
         self._restart_tray()
+
+    def _start_schedule_monitor(self) -> None:
+        self._reset_schedule_monitor()
+
+    def _reset_schedule_monitor(self) -> None:
+        if self._schedule_check_job is not None:
+            try:
+                self.root.after_cancel(self._schedule_check_job)
+            except Exception:
+                pass
+            self._schedule_check_job = None
+        self._last_schedule_lock = None
+        self._last_schedule_lock_timestamp = None
+        self._active_schedule_marker = None
+        if self.schedule:
+            self._schedule_check_job = self.root.after(1000, self._schedule_tick)
+        self._destroy_schedule_overlay()
+
+    def _schedule_tick(self) -> None:
+        self._schedule_check_job = None
+        if not self.schedule:
+            return
+        now = datetime.now()
+        minutes = now.hour * 60 + now.minute
+        today = now.date().isoformat()
+        lock_marker: tuple[str, str, str] | None = None
+        overlay_marker: tuple[str, str] | None = None
+        for index, entry in enumerate(self.schedule):
+            start_minutes = self._time_to_minutes(entry["start"])
+            end_minutes = self._time_to_minutes(entry["end"])
+            if start_minutes is None or end_minutes is None:
+                continue
+            if start_minutes <= minutes < end_minutes:
+                lock_marker = (today, entry["start"], entry["end"])
+                overlay_marker = (entry["start"], entry["end"])
+                next_entry = (
+                    self.schedule[index + 1]
+                    if index + 1 < len(self.schedule)
+                    else None
+                )
+                self._show_schedule_overlay(now, entry, next_entry, index)
+                if self._should_lock_again(lock_marker, now):
+                    self._lock_workstation(entry.get("label", ""))
+                    self._last_schedule_lock = lock_marker
+                    self._last_schedule_lock_timestamp = now
+                break
+        if overlay_marker is None:
+            self._destroy_schedule_overlay()
+            self._active_schedule_marker = None
+        else:
+            self._active_schedule_marker = overlay_marker
+        if lock_marker is None:
+            self._last_schedule_lock = None
+            self._last_schedule_lock_timestamp = None
+        if self.schedule:
+            self._schedule_check_job = self.root.after(1000, self._schedule_tick)
+
+    # Estimated time helpers
+    def _current_elapsed_seconds(self) -> int:
+        if not self.start_time:
+            return 0
+        elapsed = self.elapsed_before_pause
+        if self.task_active and not self.paused and self.start_time:
+            elapsed += datetime.now() - self.start_time
+        return max(0, int(elapsed.total_seconds()))
+
+    def _format_estimate_text(self) -> tuple[str, str]:
+        if not self._estimate_minutes or not self.start_time:
+            return "", "#ffffff"
+        elapsed_sec = self._current_elapsed_seconds()
+        est_sec = max(1, self._estimate_minutes * 60)
+        ratio = elapsed_sec / est_sec
+        # Colors
+        GREEN = "#4caf50"
+        YELLOW = "#ffeb3b"
+        ORANGE = "#ff9800"
+        RED = "#ff3b30"
+        if ratio <= 0.5:
+            color = GREEN
+        elif ratio <= 0.8:
+            color = YELLOW
+        elif ratio <= 1.0:
+            color = ORANGE
+        else:
+            color = RED
+        minutes = self._estimate_minutes
+        if ratio <= 1.0:
+            text = self._t("estimate_label", minutes=minutes)
+        else:
+            over_min = (elapsed_sec - est_sec + 59) // 60
+            text = self._t("estimate_over_label", minutes=over_min)
+        return text, color
+
+    def _show_schedule_overlay(
+        self,
+        now: datetime,
+        current_entry: dict[str, str],
+        next_entry: dict[str, str] | None,
+        current_index: int,
+    ) -> None:
+        overlay = self._ensure_schedule_overlay()
+        if overlay is None:
+            return
+        try:
+            overlay.deiconify()
+            overlay.attributes("-topmost", True)
+            overlay.lift()
+            overlay.focus_force()
+        except Exception:
+            pass
+        remaining = self._calculate_schedule_remaining(now, current_entry)
+        remaining_text = self._format_overlay_remaining(remaining)
+        label = (
+            current_entry.get("label", "").strip()
+            or self._t("schedule_default_label")
+        )
+        current_text = self._t(
+            "overlay_current",
+            label=label,
+            start=current_entry["start"],
+            end=current_entry["end"],
+        )
+        remaining_line = self._t("overlay_remaining", time=remaining_text)
+        if self._schedule_overlay_time_label:
+            self._schedule_overlay_time_label.config(
+                text=now.strftime("%H:%M:%S"),
+                font=self._schedule_overlay_time_font,
+            )
+        if self._schedule_overlay_current_label:
+            self._schedule_overlay_current_label.config(
+                text=f"{current_text}\n{remaining_line}",
+                font=self._schedule_overlay_current_font,
+            )
+        if self._schedule_overlay_schedule_label:
+            schedule_lines = [self._t("overlay_schedule_title")]
+            for idx, entry in enumerate(self.schedule):
+                entry_label = (
+                    entry.get("label", "").strip()
+                    or self._t("schedule_default_label")
+                )
+                line = f"{entry['start']} - {entry['end']}  {entry_label}"
+                prefix = "> " if idx == current_index else "  "
+                schedule_lines.append(f"{prefix}{line}")
+            if next_entry:
+                next_label = next_entry.get("label", "").strip() or self._t(
+                    "schedule_default_label"
+                )
+                schedule_lines.append(
+                    self._t(
+                        "overlay_next",
+                        label=next_label,
+                        start=next_entry["start"],
+                        end=next_entry["end"],
+                    )
+                )
+            self._schedule_overlay_schedule_label.config(
+                text="\n".join(schedule_lines),
+                font=self._schedule_overlay_schedule_font,
+            )
+        try:
+            overlay.update_idletasks()
+        except Exception:
+            pass
+
+    def _ensure_schedule_overlay(self) -> tk.Toplevel | None:
+        if self.schedule_overlay and tk.Toplevel.winfo_exists(self.schedule_overlay):
+            return self.schedule_overlay
+        try:
+            overlay = tk.Toplevel(self.root)
+        except Exception:
+            return None
+        overlay.withdraw()
+        overlay.overrideredirect(True)
+        overlay.configure(bg="black", cursor="none")
+        overlay.protocol("WM_DELETE_WINDOW", lambda: None)
+        try:
+            overlay.attributes("-fullscreen", True)
+        except Exception:
+            overlay.attributes("-topmost", True)
+            try:
+                overlay.state("zoomed")
+            except Exception:
+                pass
+        else:
+            overlay.attributes("-topmost", True)
+        frame = tk.Frame(overlay, bg="black")
+        frame.pack(fill="both", expand=True)
+        base_size = max(self.font_size, 18)
+        time_size = max(72, base_size * 3)
+        focus_size = max(36, base_size * 2)
+        schedule_size = max(22, base_size + 6)
+        self._schedule_overlay_time_font = tkfont.Font(
+            family=self.font_family,
+            size=time_size,
+            weight="bold",
+        )
+        self._schedule_overlay_current_font = tkfont.Font(
+            family=self.font_family,
+            size=focus_size,
+            weight="bold",
+        )
+        self._schedule_overlay_schedule_font = tkfont.Font(
+            family=self.font_family,
+            size=schedule_size,
+            weight="normal",
+        )
+        self._schedule_overlay_time_label = tk.Label(
+            frame,
+            fg="white",
+            bg="black",
+            justify="center",
+            font=self._schedule_overlay_time_font,
+        )
+        self._schedule_overlay_time_label.pack(fill="x", pady=(80, 40))
+        self._schedule_overlay_current_label = tk.Label(
+            frame,
+            fg="white",
+            bg="black",
+            justify="center",
+            font=self._schedule_overlay_current_font,
+        )
+        self._schedule_overlay_current_label.pack(fill="x", pady=(0, 40))
+        self._schedule_overlay_schedule_label = tk.Label(
+            frame,
+            fg="white",
+            bg="black",
+            justify="center",
+            font=self._schedule_overlay_schedule_font,
+        )
+        self._schedule_overlay_schedule_label.pack(fill="both", expand=True, padx=40)
+        try:
+            overlay.update_idletasks()
+            wrap_length = max(400, overlay.winfo_screenwidth() - 200)
+            if self._schedule_overlay_current_label:
+                self._schedule_overlay_current_label.config(wraplength=wrap_length)
+            if self._schedule_overlay_schedule_label:
+                self._schedule_overlay_schedule_label.config(wraplength=wrap_length)
+        except Exception:
+            pass
+        self.schedule_overlay = overlay
+        return overlay
+
+    def _calculate_schedule_remaining(
+        self, now: datetime, entry: dict[str, str]
+    ) -> timedelta:
+        try:
+            end_time = datetime.strptime(entry["end"], "%H:%M").time()
+        except (KeyError, ValueError):
+            return timedelta()
+        end_dt = now.replace(
+            hour=end_time.hour,
+            minute=end_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if end_dt < now:
+            end_dt += timedelta(days=1)
+        return max(end_dt - now, timedelta())
+
+    def _format_overlay_remaining(self, remaining: timedelta) -> str:
+        total_seconds = max(0, int(remaining.total_seconds()))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _should_lock_again(
+        self, marker: tuple[str, str, str], now: datetime
+    ) -> bool:
+        if self._last_schedule_lock != marker:
+            return True
+        if self._last_schedule_lock_timestamp is None:
+            return True
+        return now - self._last_schedule_lock_timestamp >= timedelta(seconds=15)
+
+    def _destroy_schedule_overlay(self) -> None:
+        if self.schedule_overlay and tk.Toplevel.winfo_exists(self.schedule_overlay):
+            try:
+                self.schedule_overlay.destroy()
+            except Exception:
+                pass
+        self.schedule_overlay = None
+        self._schedule_overlay_time_label = None
+        self._schedule_overlay_current_label = None
+        self._schedule_overlay_schedule_label = None
+        self._schedule_overlay_time_font = None
+        self._schedule_overlay_current_font = None
+        self._schedule_overlay_schedule_font = None
+
+    def _lock_workstation(self, label: str) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            ctypes.windll.user32.LockWorkStation()
+        except Exception:
+            if not self._lock_fail_notified:
+                messagebox.showerror(
+                    self._t("notice_title"),
+                    self._t("error_lock_failed"),
+                )
+                self._lock_fail_notified = True
+
+    def open_schedule_manager(self) -> None:
+        if self.schedule_window and tk.Toplevel.winfo_exists(self.schedule_window):
+            self.schedule_window.deiconify()
+            self.schedule_window.lift()
+            self._refresh_schedule_language()
+            return
+        self.schedule_window = tk.Toplevel(self.root)
+        self.schedule_window.title(self._t("schedule_title"))
+        self.schedule_window.resizable(False, False)
+        self.schedule_window.attributes("-topmost", True)
+        self.schedule_window.protocol("WM_DELETE_WINDOW", self._close_schedule_window)
+        self.schedule_window.transient(self.root)
+
+        list_frame = tk.Frame(self.schedule_window)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(12, 8))
+        self.schedule_listbox = tk.Listbox(list_frame, height=10, activestyle="none")
+        self.schedule_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(
+            list_frame, orient="vertical", command=self.schedule_listbox.yview
+        )
+        scrollbar.pack(side="right", fill="y")
+        self.schedule_listbox.config(yscrollcommand=scrollbar.set)
+
+        button_frame = tk.Frame(self.schedule_window)
+        button_frame.pack(fill="x", padx=12, pady=(0, 12))
+        self.schedule_add_button = tk.Button(
+            button_frame,
+            text=self._t("schedule_add"),
+            width=10,
+            command=lambda: self._open_schedule_editor(None),
+        )
+        self.schedule_add_button.pack(side="left", padx=4)
+        self.schedule_edit_button = tk.Button(
+            button_frame,
+            text=self._t("schedule_edit"),
+            width=10,
+            command=self._edit_schedule_entry,
+        )
+        self.schedule_edit_button.pack(side="left", padx=4)
+        self.schedule_delete_button = tk.Button(
+            button_frame,
+            text=self._t("schedule_delete"),
+            width=10,
+            command=self._delete_schedule_entry,
+        )
+        self.schedule_delete_button.pack(side="left", padx=4)
+
+        self._refresh_schedule_language()
+        self.schedule_window.grab_set()
+
+    def _get_schedule_selection_index(self) -> int | None:
+        if not self.schedule_listbox:
+            return None
+        selection = self.schedule_listbox.curselection()
+        if not selection:
+            messagebox.showinfo(
+                self._t("notice_title"),
+                self._t("schedule_no_selection"),
+            )
+            return None
+        return int(selection[0])
+
+    def _open_schedule_editor(self, index: int | None) -> None:
+        if index is not None and (index < 0 or index >= len(self.schedule)):
+            return
+        parent = self.schedule_window or self.root
+        editor = tk.Toplevel(parent)
+        editor.title(self._t("schedule_title"))
+        editor.resizable(False, False)
+        editor.attributes("-topmost", True)
+        editor.transient(parent)
+
+        current = (
+            self.schedule[index]
+            if index is not None
+            else {
+                "label": self._t("schedule_default_label"),
+                "start": "12:00",
+                "end": "13:00",
+            }
+        )
+
+        label_var = tk.StringVar(value=current.get("label", ""))
+        start_var = tk.StringVar(value=current.get("start", "12:00"))
+        end_var = tk.StringVar(value=current.get("end", "13:00"))
+
+        form = tk.Frame(editor, padx=12, pady=12)
+        form.pack(fill="both", expand=True)
+
+        tk.Label(form, text=self._t("schedule_label")).grid(row=0, column=0, sticky="w")
+        label_entry = tk.Entry(form, textvariable=label_var, width=24)
+        label_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        tk.Label(form, text=self._t("schedule_start")).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        start_entry = tk.Entry(form, textvariable=start_var, width=12)
+        start_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        tk.Label(form, text=self._t("schedule_end")).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        end_entry = tk.Entry(form, textvariable=end_var, width=12)
+        end_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        form.columnconfigure(1, weight=1)
+
+        button_frame = tk.Frame(editor, pady=12)
+        button_frame.pack()
+
+        def save_entry() -> None:
+            label_value = label_var.get().strip() or self._t("schedule_default_label")
+            start_value = self._normalize_time_string(start_var.get())
+            end_value = self._normalize_time_string(end_var.get())
+            if not start_value or not end_value:
+                messagebox.showerror(
+                    self._t("notice_title"),
+                    self._t("error_invalid_time"),
+                )
+                return
+            start_minutes = self._time_to_minutes(start_value)
+            end_minutes = self._time_to_minutes(end_value)
+            if start_minutes is None or end_minutes is None or start_minutes >= end_minutes:
+                messagebox.showerror(
+                    self._t("notice_title"),
+                    self._t("error_time_order"),
+                )
+                return
+            updated = list(self.schedule)
+            new_entry = {"label": label_value, "start": start_value, "end": end_value}
+            if index is None:
+                updated.append(new_entry)
+            else:
+                updated[index] = new_entry
+            self._save_schedule(updated)
+            editor.destroy()
+
+        def cancel_entry() -> None:
+            editor.destroy()
+
+        tk.Button(
+            button_frame, text=self._t("button_save"), width=10, command=save_entry
+        ).pack(side="left", padx=4)
+        tk.Button(
+            button_frame, text=self._t("button_cancel"), width=10, command=cancel_entry
+        ).pack(side="left", padx=4)
+
+        editor.grab_set()
+        label_entry.focus_set()
+
+    def _edit_schedule_entry(self) -> None:
+        index = self._get_schedule_selection_index()
+        if index is None:
+            return
+        self._open_schedule_editor(index)
+
+    def _delete_schedule_entry(self) -> None:
+        index = self._get_schedule_selection_index()
+        if index is None:
+            return
+        if not messagebox.askyesno(
+            self._t("notice_title"),
+            self._t("confirm_delete_schedule"),
+        ):
+            return
+        updated = list(self.schedule)
+        updated.pop(index)
+        self._save_schedule(updated)
+
+    def _save_schedule(self, entries: list[dict[str, str]]) -> None:
+        sanitized = ensure_schedule(entries)
+        self.schedule = [dict(entry) for entry in sanitized]
+        self.config.schedule = [dict(entry) for entry in sanitized]
+        self._persist_config()
+        self._refresh_schedule_listbox()
+        self._reset_schedule_monitor()
+
+    def _refresh_schedule_listbox(self) -> None:
+        if not self.schedule_listbox:
+            return
+        self.schedule_listbox.delete(0, "end")
+        for entry in self.schedule:
+            text = f"{entry['start']} - {entry['end']}  {entry['label']}"
+            self.schedule_listbox.insert("end", text)
+
+    def _refresh_schedule_language(self) -> None:
+        if not self.schedule_window or not tk.Toplevel.winfo_exists(self.schedule_window):
+            return
+        self.schedule_window.title(self._t("schedule_title"))
+        if self.schedule_add_button:
+            self.schedule_add_button.config(text=self._t("schedule_add"))
+        if self.schedule_edit_button:
+            self.schedule_edit_button.config(text=self._t("schedule_edit"))
+        if self.schedule_delete_button:
+            self.schedule_delete_button.config(text=self._t("schedule_delete"))
+        self._refresh_schedule_listbox()
+
+    def _close_schedule_window(self) -> None:
+        if self.schedule_window:
+            self.schedule_window.destroy()
+        self.schedule_window = None
+        self.schedule_listbox = None
+        self.schedule_add_button = None
+        self.schedule_edit_button = None
+        self.schedule_delete_button = None
 
     def open_history(self) -> None:
         if self.history_window and tk.Toplevel.winfo_exists(self.history_window):
@@ -679,6 +1324,7 @@ class TaskApp:
         self._build_context_menu()
         self._update_pause_controls()
         self._refresh_history_language()
+        self._refresh_schedule_language()
         if self.paused:
             paused_message = f"{self._t('pause_prefix')} {self.base_message}"
             self.set_message(paused_message)
@@ -775,6 +1421,13 @@ class TaskApp:
         language_var.trace_add("write", update_language_label)
         update_language_label()
         language_option.grid(row=7, column=1, sticky="ew")
+
+        schedule_button = tk.Button(
+            main_frame,
+            text=self._t("label_schedule_button"),
+            command=self.open_schedule_manager,
+        )
+        schedule_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
 
         main_frame.columnconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
@@ -886,6 +1539,11 @@ class TaskApp:
             pystray.MenuItem(self._t("tray_hide"), self._tray_hide),
             pystray.MenuItem(self._current_pause_label(), self._tray_pause),
             pystray.MenuItem(self._t("tray_edit"), self._tray_edit),
+            pystray.MenuItem(
+                self._t("tray_autostart"),
+                self._tray_autostart,
+                checked=lambda item: self._is_autostart_enabled(),
+            ),
             pystray.MenuItem(self._t("tray_history"), self._tray_history),
             pystray.MenuItem(self._t("tray_quit"), self._tray_quit),
         )
@@ -897,6 +1555,81 @@ class TaskApp:
         )
         thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         thread.start()
+
+    # Autostart (Windows) helpers
+    def _tray_autostart(self, _icon, _item) -> None:
+        self.on_ui_thread(self.toggle_autostart)
+
+    def toggle_autostart(self) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            if self._is_autostart_enabled():
+                self._disable_autostart()
+            else:
+                self._enable_autostart()
+        finally:
+            self._restart_tray()
+
+    def _is_autostart_enabled(self) -> bool:
+        if not sys.platform.startswith("win"):
+            return False
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_READ,
+            ) as key:
+                winreg.QueryValueEx(key, self._autostart_value_name())
+                return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def _enable_autostart(self) -> None:
+        cmd = self._autostart_command()
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.SetValueEx(
+                    key, self._autostart_value_name(), 0, winreg.REG_SZ, cmd
+                )
+        except OSError as err:
+            messagebox.showerror(self._t("notice_title"), str(err))
+
+    def _disable_autostart(self) -> None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                try:
+                    winreg.DeleteValue(key, self._autostart_value_name())
+                except FileNotFoundError:
+                    pass
+        except OSError as err:
+            messagebox.showerror(self._t("notice_title"), str(err))
+
+    def _autostart_value_name(self) -> str:
+        return "AttentionTask"
+
+    def _autostart_command(self) -> str:
+        exe = Path(sys.executable)
+        if sys.platform.startswith("win"):
+            pythonw = exe.with_name("pythonw.exe")
+            if pythonw.exists():
+                exe = pythonw
+        script = Path(sys.argv[0]).resolve()
+        config_path = self.config_path.resolve()
+        return f'"{exe}" "{script}" --config "{config_path}"'
 
     def _restart_tray(self) -> None:
         if not self.tray_icon:
@@ -925,6 +1658,8 @@ class TaskApp:
 
     def quit(self) -> None:
         self._close_history()
+        self._close_schedule_window()
+        self._destroy_schedule_overlay()
         if self.tray_icon:
             self.tray_icon.stop()
         if self._time_job is not None:
@@ -933,6 +1668,12 @@ class TaskApp:
             except Exception:
                 pass
             self._time_job = None
+        if self._schedule_check_job is not None:
+            try:
+                self.root.after_cancel(self._schedule_check_job)
+            except Exception:
+                pass
+            self._schedule_check_job = None
         self.root.quit()
         self.root.destroy()
 
