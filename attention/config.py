@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .constants import (
@@ -62,6 +63,35 @@ def ensure_language(value: str | None, fallback: str) -> str:
     return code if code in SUPPORTED_LANGUAGES else fallback
 
 
+def _normalize_time(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value.strip(), "%H:%M")
+        return dt.strftime("%H:%M")
+    except ValueError:
+        return None
+
+
+def ensure_schedule(value) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    schedule: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        start = _normalize_time(item.get("start"))
+        end = _normalize_time(item.get("end"))
+        label = str(item.get("label") or "").strip() or "Break"
+        if not start or not end or start == end:
+            continue
+        if start >= end:
+            continue
+        schedule.append({"start": start, "end": end, "label": label})
+    schedule.sort(key=lambda entry: entry["start"])
+    return schedule
+
+
 @dataclass
 class TaskConfig:
     message: str = DEFAULT_MESSAGE
@@ -73,6 +103,7 @@ class TaskConfig:
     outline_color: str = DEFAULT_OUTLINE_COLOR
     transparency: float = DEFAULT_TRANSPARENCY
     language: str = DEFAULT_LANGUAGE
+    schedule: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "TaskConfig":
@@ -102,6 +133,7 @@ class TaskConfig:
             data.get("transparency"), DEFAULT_TRANSPARENCY
         )
         language = ensure_language(data.get("language"), DEFAULT_LANGUAGE)
+        schedule = ensure_schedule(data.get("schedule"))
         return cls(
             message=message,
             x=x,
@@ -112,6 +144,7 @@ class TaskConfig:
             outline_color=outline_color,
             transparency=transparency,
             language=language,
+            schedule=schedule,
         )
 
     def save(self, path: Path) -> None:
