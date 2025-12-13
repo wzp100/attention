@@ -80,6 +80,7 @@ LANG_STRINGS: dict[str, dict[str, str]] = {
         "overlay_remaining": "Remaining {time}",
         "overlay_schedule_title": "Today's Schedule",
         "overlay_next": "Next: {label} ({start} - {end})",
+        "schedule_prelock_notice": "Upcoming lock for {label} at {start}-{end} in 30 minutes.",
     },
     "zh": {
         "app_title": "任务提醒",
@@ -156,6 +157,7 @@ LANG_STRINGS: dict[str, dict[str, str]] = {
         "confirm_delete_schedule": "确定删除选中的时间段吗？",
         "error_invalid_time": "时间格式不正确，请使用 HH:MM。",
         "error_time_order": "结束时间必须晚于开始时间。",
+        "schedule_prelock_notice": "将在30分钟后锁屏：{label}（{start}-{end}），请提前保存。",
     },
 }
 
