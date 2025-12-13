@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "PyQt6>=6.7.0",
+    "pyqt6>=6.7.0",
 ]
 
 [tool.pytest.ini_options]
