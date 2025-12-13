@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 try:  # pragma: no cover - allow headless tests
-    from PyQt6 import QtWidgets
+    from PyQt6 import QtGui, QtWidgets
 except Exception as exc:  # pragma: no cover
     from types import SimpleNamespace
 
-    QtWidgets = SimpleNamespace(QDialog=object)  # type: ignore[assignment]
+    QtGui = QtWidgets = SimpleNamespace(QDialog=object, QFont=object)  # type: ignore[assignment]
     _IMPORT_ERROR = exc
 else:  # pragma: no cover
     _IMPORT_ERROR = None
@@ -40,7 +40,15 @@ class SettingsDialog(QtWidgets.QDialog):
 
         form = QtWidgets.QFormLayout()
         self._text_edit = QtWidgets.QPlainTextEdit(self.config.message)
-        self._font_edit = QtWidgets.QLineEdit(self.config.font_family)
+        self._font_combo = QtWidgets.QFontComboBox()
+        self._font_combo.setEditable(False)
+        current_index = self._font_combo.findText(self.config.font_family)
+        if current_index == -1:
+            # Keep the previous selection visible even if the font is not installed.
+            self._font_combo.insertItem(0, self.config.font_family)
+            self._font_combo.setCurrentIndex(0)
+        else:
+            self._font_combo.setCurrentIndex(current_index)
         self._font_size_spin = QtWidgets.QSpinBox()
         self._font_size_spin.setRange(8, 96)
         self._font_size_spin.setValue(self.config.font_size)
@@ -57,7 +65,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self._language_combo.setCurrentIndex(max(0, current_index))
 
         form.addRow(self.translator("label_text"), self._text_edit)
-        form.addRow(self.translator("label_font"), self._font_edit)
+        form.addRow(self.translator("label_font"), self._font_combo)
         form.addRow(self.translator("label_font_size"), self._font_size_spin)
         form.addRow(self.translator("label_text_color"), self._text_color_edit)
         form.addRow(self.translator("label_outline_color"), self._outline_color_edit)
@@ -88,7 +96,8 @@ class SettingsDialog(QtWidgets.QDialog):
                 self, self.translator("notice_title"), self.translator("error_empty")
             )
             return None
-        font_family = self._font_edit.text().strip() or self.config.font_family
+        selected_font = self._font_combo.currentFont()
+        font_family = selected_font.family().strip() or self.config.font_family
         font_size = ensure_font_size(self._font_size_spin.value(), self.config.font_size)
         text_color = ensure_color(self._text_color_edit.text().strip(), self.config.text_color)
         outline_color = ensure_color(
