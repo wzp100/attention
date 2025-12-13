@@ -84,21 +84,26 @@ class TaskState:
             elapsed += datetime.now() - self.start_time
         return max(0, int(elapsed.total_seconds()))
 
-    def time_text(self) -> str:
-        if not self.active and self.message in NO_TASK_VALUES:
-            return ""
-        if not self.start_time:
-            return translate(self.language, "time_started")
-        elapsed = self.elapsed_seconds()
-        if elapsed < 60:
+    def _elapsed_label(self, elapsed_seconds: int) -> str:
+        if elapsed_seconds < 60:
             return translate(self.language, "time_elapsed_less_minute")
-        minutes = elapsed // 60
+        minutes = elapsed_seconds // 60
         if minutes < 60:
             return translate(self.language, "time_elapsed_minutes", minutes=minutes)
         hours, rem = divmod(minutes, 60)
         if rem == 0:
             return translate(self.language, "time_elapsed_hours_only", hours=hours)
         return translate(self.language, "time_elapsed_hours", hours=hours, minutes=rem)
+
+    def time_text(self) -> str:
+        if not self.active and self.message in NO_TASK_VALUES:
+            return ""
+        if not self.start_time:
+            return translate(self.language, "time_started")
+        start_label = translate(self.language, "time_started")
+        start_time_str = self.start_time.strftime("%H:%M:%S")
+        elapsed_label = self._elapsed_label(self.elapsed_seconds())
+        return f"{start_label}: {start_time_str} · {elapsed_label}"
 
     def estimate_text(self) -> tuple[str, str]:
         if not self.estimate_minutes or not self.start_time:
