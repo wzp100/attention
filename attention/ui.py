@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import sys
-
-import sys
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -37,110 +34,21 @@ from .constants import (
     DEFAULT_TRANSPARENCY,
     PAUSE_TEXT_COLOR,
     STOP_TEXT_COLOR,
+    TIME_TEXT_COLOR,
 )
 from .history import TaskRecord, append_record, load_history
 from .i18n import NO_TASK_VALUES, translate
+from .schedule import ScheduleController
+from .settings import SettingsDialog
+from .task_state import TaskState
 
 
-@dataclass
-class TaskState:
-    message: str = DEFAULT_MESSAGE
-    language: str = DEFAULT_LANGUAGE
-    text_color: str = DEFAULT_TEXT_COLOR
-    outline_color: str = DEFAULT_OUTLINE_COLOR
-    transparency: float = DEFAULT_TRANSPARENCY
-    font_family: str = DEFAULT_FONT_FAMILY
-    font_size: int = DEFAULT_FONT_SIZE
-    estimate_minutes: Optional[int] = None
-    active: bool = False
-    paused: bool = False
-    start_time: Optional[datetime] = None
-    elapsed_before_pause: timedelta = field(default_factory=timedelta)
-
-    def start(self, task_name: str, estimate_minutes: Optional[int] = None) -> None:
-        task_name = task_name.strip()
-        if not task_name:
-            return
-        self.message = task_name
-        self.estimate_minutes = estimate_minutes
-        self.active = True
-        self.paused = False
-        self.start_time = datetime.now()
-        self.elapsed_before_pause = timedelta()
-        self.text_color = ACTIVE_TEXT_COLOR
-
-    def pause(self) -> None:
-        if not self.active or self.paused:
-            return
-        if self.start_time:
-            self.elapsed_before_pause += datetime.now() - self.start_time
-        self.paused = True
-        self.text_color = PAUSE_TEXT_COLOR
-        prefix = translate(self.language, "pause_prefix")
-        if not self.message.startswith(prefix):
-            self.message = f"{prefix} {self.message}"
-
-    def resume(self) -> None:
-        if not self.active or not self.paused:
-            return
-        self.paused = False
-        self.text_color = ACTIVE_TEXT_COLOR
-        prefix = translate(self.language, "pause_prefix")
-        if self.message.startswith(prefix):
-            self.message = self.message[len(prefix) :].lstrip()
-        self.start_time = datetime.now()
-
-    def stop(self) -> None:
-        self.active = False
-        self.paused = False
-        self.start_time = None
-        self.elapsed_before_pause = timedelta()
-        self.message = translate(self.language, "no_task")
-        self.text_color = STOP_TEXT_COLOR
-        self.estimate_minutes = None
-
-    def elapsed_seconds(self) -> int:
-        elapsed = self.elapsed_before_pause
-        if self.active and not self.paused and self.start_time:
-            elapsed += datetime.now() - self.start_time
-        return max(0, int(elapsed.total_seconds()))
-
-    def time_text(self) -> str:
-        if not self.active and self.message in NO_TASK_VALUES:
-            return ""
-        if not self.start_time:
-            return translate(self.language, "time_started")
-        elapsed = self.elapsed_seconds()
-        if elapsed < 60:
-            return translate(self.language, "time_elapsed_less_minute")
-        minutes = elapsed // 60
-        if minutes < 60:
-            return translate(self.language, "time_elapsed_minutes", minutes=minutes)
-        hours, rem = divmod(minutes, 60)
-        if rem == 0:
-            return translate(self.language, "time_elapsed_hours_only", hours=hours)
-        return translate(self.language, "time_elapsed_hours", hours=hours, minutes=rem)
-
-    def estimate_text(self) -> tuple[str, str]:
-        if not self.estimate_minutes or not self.start_time:
-            return "", STOP_TEXT_COLOR
-        elapsed = self.elapsed_seconds()
-        est_seconds = max(1, self.estimate_minutes * 60)
-        ratio = elapsed / est_seconds
-        if ratio <= 0.5:
-            color = "#4caf50"
-        elif ratio <= 0.8:
-            color = "#ffeb3b"
-        elif ratio <= 1.0:
-            color = "#ff9800"
-        else:
-            color = "#ff3b30"
-        if ratio <= 1.0:
-            text = translate(self.language, "estimate_label", minutes=self.estimate_minutes)
-        else:
-            over_min = (elapsed - est_seconds + 59) // 60
-            text = translate(self.language, "estimate_over_label", minutes=over_min)
-        return text, color
+def apply_outline_effect(label: QtWidgets.QLabel, color: str) -> None:
+    effect = QtWidgets.QGraphicsDropShadowEffect(label)
+    effect.setBlurRadius(4)
+    effect.setOffset(0, 0)
+    effect.setColor(QtGui.QColor(color))
+    label.setGraphicsEffect(effect)
 
 
 class TaskApp(QtWidgetBase):
@@ -201,6 +109,15 @@ class TaskApp(QtWidgetBase):
         self._tray = self._build_tray_icon()
         self._tray.show()
 
+        self.schedule_controller = ScheduleController(
+            translator=self.tr,
+            font_family=self.state.font_family,
+            base_size=self.state.font_size,
+            schedule=self.config.schedule,
+            parent=self,
+        )
+        self.schedule_controller.start()
+
         self._restore_geometry()
         self._refresh_labels()
 
@@ -231,15 +148,25 @@ class TaskApp(QtWidgetBase):
         self._message_label.setFont(bold_font)
         self._time_label.setFont(small_font)
         self._estimate_label.setFont(small_font)
-        palette = self._message_label.palette()
-        palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(self.state.text_color))
-        self._message_label.setPalette(palette)
+
+        message_palette = self._message_label.palette()
+        message_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(self.state.text_color))
+        self._message_label.setPalette(message_palette)
         time_palette = self._time_label.palette()
-        time_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#ffffff"))
+        time_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(TIME_TEXT_COLOR))
         self._time_label.setPalette(time_palette)
+
+        apply_outline_effect(self._message_label, self.state.outline_color)
+        apply_outline_effect(self._time_label, self.state.outline_color)
+        apply_outline_effect(self._estimate_label, self.state.outline_color)
 
     def _refresh_labels(self) -> None:
         self._message_label.setText(self.state.message)
+        message_palette = self._message_label.palette()
+        message_palette.setColor(
+            QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(self.state.text_color)
+        )
+        self._message_label.setPalette(message_palette)
         self._time_label.setText(self.state.time_text())
         est_text, est_color = self.state.estimate_text()
         self._estimate_label.setText(est_text)
@@ -247,6 +174,7 @@ class TaskApp(QtWidgetBase):
         est_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(est_color))
         self._estimate_label.setPalette(est_palette)
         self.adjustSize()
+        self._tray.setToolTip(self.state.message)
 
     # Context menu and tray
     def _build_tray_icon(self) -> QtWidgets.QSystemTrayIcon:
@@ -280,6 +208,10 @@ class TaskApp(QtWidgetBase):
         stop_action = menu.addAction(self.tr("menu_stop"))
         stop_action.triggered.connect(self.stop_task)
         menu.addSeparator()
+        settings_action = menu.addAction(self.tr("settings_title"))
+        settings_action.triggered.connect(self.open_settings)
+        schedule_action = menu.addAction(self.tr("label_schedule_button"))
+        schedule_action.triggered.connect(lambda: self._open_schedule_manager(self))
         history_action = menu.addAction(self.tr("menu_history"))
         history_action.triggered.connect(self.show_history)
         menu.addSeparator()
@@ -360,6 +292,7 @@ class TaskApp(QtWidgetBase):
         else:
             self.state.pause()
             append_record(TaskRecord.create("pause", self.state.message))
+        self.config.text_color = self.state.text_color
         self._persist_config()
         self._refresh_labels()
 
@@ -445,6 +378,48 @@ class TaskApp(QtWidgetBase):
         dialog.resize(480, 360)
         dialog.exec()
 
+    # Settings and schedule
+    def open_settings(self) -> None:
+        config_copy = TaskConfig(**asdict(self.config))
+        dialog = SettingsDialog(config_copy, self.tr, self._open_schedule_manager, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        updated = dialog.apply_changes()
+        if not updated:
+            return
+        self._apply_config(updated)
+        self._persist_config()
+        self._refresh_labels()
+
+    def _apply_config(self, new_config: TaskConfig) -> None:
+        self.config = new_config
+        self.state.language = ensure_language(new_config.language, self.state.language)
+        self.state.message = new_config.message
+        self.state.font_family = new_config.font_family
+        self.state.font_size = ensure_font_size(new_config.font_size, self.state.font_size)
+        self.state.text_color = ensure_color(new_config.text_color, self.state.text_color)
+        self.state.outline_color = ensure_color(new_config.outline_color, self.state.outline_color)
+        self.state.transparency = ensure_transparency(
+            new_config.transparency, self.state.transparency
+        )
+        self.schedule_controller.set_font(self.state.font_family, self.state.font_size)
+        sanitized_schedule = self.schedule_controller.set_schedule(new_config.schedule)
+        self.config.schedule = [asdict(entry) for entry in sanitized_schedule]
+        self.schedule_controller.start()
+        self.setWindowOpacity(self.state.transparency)
+        self.setWindowTitle(self.tr("app_title"))
+        self._apply_font()
+
+    def _open_schedule_manager(self, parent: QtWidgets.QWidget | None = None) -> None:
+        entries = self.schedule_controller.open_manager(parent)
+        target_config: TaskConfig = self.config
+        if isinstance(parent, SettingsDialog):
+            target_config = parent.config
+        target_config.schedule = [asdict(entry) for entry in entries]
+        self.schedule_controller.set_schedule(target_config.schedule)
+        if parent is None or not isinstance(parent, SettingsDialog):
+            self._persist_config()
+
     # Config helpers
     def _persist_config(self) -> None:
         try:
@@ -455,6 +430,7 @@ class TaskApp(QtWidgetBase):
             self.config.font_family = self.state.font_family
             self.config.font_size = self.state.font_size
             self.config.message = self.state.message
+            self.config.schedule = [asdict(entry) for entry in self.schedule_controller.entries]
             self.config.save(self.config_path)
         except OSError as exc:  # pragma: no cover - fs issues
             QtWidgets.QMessageBox.critical(
