@@ -12,3 +12,7 @@ wheels/
 
 # 日志文件
 task_history.json
+
+
+# 配置文件
+config.json
