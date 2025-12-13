@@ -298,6 +298,7 @@ class ScheduleController(QtCore.QObject):
         self.entries = [ScheduleEntry(**entry) for entry in ensure_schedule(list(schedule))]
         self._last_lock_marker: tuple[str, str, str] | None = None
         self._last_lock_timestamp: datetime | None = None
+        self._last_pre_notice_marker: tuple[str, str, str] | None = None
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._overlay: ScheduleOverlay | None = None
@@ -312,6 +313,7 @@ class ScheduleController(QtCore.QObject):
     def set_schedule(self, entries: Iterable[dict[str, str]]) -> list[ScheduleEntry]:
         sanitized = ensure_schedule(list(entries))
         self.entries = [ScheduleEntry(**entry) for entry in sanitized]
+        self._last_pre_notice_marker = None
         if not self.entries:
             self.hide_overlay()
         return self.entries
@@ -335,6 +337,7 @@ class ScheduleController(QtCore.QObject):
         self.hide_overlay()
         self._last_lock_marker = None
         self._last_lock_timestamp = None
+        self._last_pre_notice_marker = None
 
     def hide_overlay(self) -> None:
         if self._overlay:
@@ -349,6 +352,7 @@ class ScheduleController(QtCore.QObject):
         today = now.date().isoformat()
         lock_marker: tuple[str, str, str] | None = None
         overlay_marker: tuple[str, str] | None = None
+        pre_notice_marker: tuple[str, str, str] | None = None
         for index, entry in enumerate(self.entries):
             start_minutes = self._to_minutes(entry.start)
             end_minutes = self._to_minutes(entry.end)
@@ -364,11 +368,20 @@ class ScheduleController(QtCore.QObject):
                     self._last_lock_marker = lock_marker
                     self._last_lock_timestamp = now
                 break
+            if minutes < start_minutes:
+                pre_notice_marker = (today, entry.start, entry.end)
+                if start_minutes - minutes <= 30:
+                    if self._should_notify_pre_lock(pre_notice_marker):
+                        self._notify_pre_lock(entry)
+                        self._last_pre_notice_marker = pre_notice_marker
+                break
         if overlay_marker is None:
             self.hide_overlay()
         if lock_marker is None:
             self._last_lock_marker = None
             self._last_lock_timestamp = None
+        if pre_notice_marker is None:
+            self._last_pre_notice_marker = None
 
     def _show_overlay(
         self, now: datetime, entry: ScheduleEntry, next_entry: ScheduleEntry | None, index: int
@@ -400,6 +413,21 @@ class ScheduleController(QtCore.QObject):
         if self._last_lock_timestamp is None:
             return True
         return now - self._last_lock_timestamp >= timedelta(seconds=15)
+
+    def _should_notify_pre_lock(self, marker: tuple[str, str, str]) -> bool:
+        return self._last_pre_notice_marker != marker
+
+    def _notify_pre_lock(self, entry: ScheduleEntry) -> None:
+        message = self.translator(
+            "schedule_prelock_notice", label=entry.label, start=entry.start, end=entry.end
+        )
+        title = self.translator("notice_title")
+        parent = self.parent()
+        tray = getattr(parent, "_tray", None)
+        if isinstance(tray, QtWidgets.QSystemTrayIcon):  # type: ignore[unreachable]
+            tray.showMessage(title, message, QtWidgets.QSystemTrayIcon.MessageIcon.Information)
+            return
+        QtWidgets.QMessageBox.information(parent, title, message)
 
     def _to_minutes(self, value: str) -> int | None:
         try:
