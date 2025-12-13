@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
 
+from datetime import timedelta
+
 import pytest
 
-from attention.ui import TaskState
 from attention.i18n import translate
+from attention.task_state import TaskState
 
 
 @pytest.fixture
