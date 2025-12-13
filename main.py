@@ -1,6 +1,9 @@
 from floating_task import main as run_app
 
 
+from floating_task import run_app
+
+
 def main() -> None:
     run_app([])
 

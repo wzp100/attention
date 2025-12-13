@@ -9,7 +9,7 @@ from attention import CONFIG_FILE, TaskApp, TaskConfig
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Floating always-on-top task window with system tray controls."
+        description="Floating always-on-top task window with system tray controls.",
     )
     parser.add_argument(
         "--text",
@@ -28,7 +28,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str]) -> None:
+def run_app(argv: list[str]) -> None:
     args = parse_args(argv)
     config_path = Path(args.config)
     config = TaskConfig.load(config_path)
@@ -39,18 +39,26 @@ def main(argv: list[str]) -> None:
         session_text = args.text.strip()
         if session_text:
             original_message = config.message
-            app.set_message(session_text, persist=not args.no_persist)
-            if args.no_persist:
+            app.state.message = session_text
+            if not args.no_persist:
+                app.config.message = session_text
+                app._persist_config()
+            else:
                 app.config.message = original_message
         else:
-            from tkinter import messagebox
+            from PyQt6 import QtWidgets
 
-            messagebox.showerror(
-                app._t("notice_title"),
-                app._t("error_empty"),
+            QtWidgets.QMessageBox.critical(
+                app,
+                app.tr("notice_title"),
+                app.tr("error_empty"),
             )
 
     app.run()
+
+
+def main(argv: list[str]) -> None:
+    run_app(argv)
 
 
 if __name__ == "__main__":
