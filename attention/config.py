@@ -103,6 +103,7 @@ class TaskConfig:
     outline_color: str = DEFAULT_OUTLINE_COLOR
     transparency: float = DEFAULT_TRANSPARENCY
     language: str = DEFAULT_LANGUAGE
+    autostart: bool = False
     schedule: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
@@ -133,6 +134,9 @@ class TaskConfig:
             data.get("transparency"), DEFAULT_TRANSPARENCY
         )
         language = ensure_language(data.get("language"), DEFAULT_LANGUAGE)
+        autostart = data.get("autostart")
+        if not isinstance(autostart, bool):
+            autostart = False
         schedule = ensure_schedule(data.get("schedule"))
         return cls(
             message=message,
@@ -144,6 +148,7 @@ class TaskConfig:
             outline_color=outline_color,
             transparency=transparency,
             language=language,
+            autostart=autostart,
             schedule=schedule,
         )
 

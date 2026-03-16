@@ -15,8 +15,9 @@ from .constants import (
     DEFAULT_TRANSPARENCY,
     PAUSE_TEXT_COLOR,
     STOP_TEXT_COLOR,
+    TIME_TEXT_COLOR,
 )
-from .i18n import NO_TASK_VALUES, translate
+from .i18n import translate
 
 
 @dataclass
@@ -96,18 +97,18 @@ class TaskState:
         return translate(self.language, "time_elapsed_hours", hours=hours, minutes=rem)
 
     def time_text(self) -> str:
-        if not self.active and self.message in NO_TASK_VALUES:
+        if not self.active or not self.start_time:
             return ""
-        if not self.start_time:
-            return translate(self.language, "time_started")
         start_label = translate(self.language, "time_started")
         start_time_str = self.start_time.strftime("%H:%M:%S")
-        elapsed_label = self._elapsed_label(self.elapsed_seconds())
-        return f"{start_label}: {start_time_str} · {elapsed_label}"
+        return f"{start_label}: {start_time_str}"
 
     def estimate_text(self) -> tuple[str, str]:
-        if not self.estimate_minutes or not self.start_time:
+        if not self.active or not self.start_time:
             return "", STOP_TEXT_COLOR
+        elapsed_label = self._elapsed_label(self.elapsed_seconds())
+        if not self.estimate_minutes:
+            return elapsed_label, TIME_TEXT_COLOR
         elapsed = self.elapsed_seconds()
         est_seconds = max(1, self.estimate_minutes * 60)
         ratio = elapsed / est_seconds
@@ -120,8 +121,10 @@ class TaskState:
         else:
             color = "#ff3b30"
         if ratio <= 1.0:
-            text = translate(self.language, "estimate_label", minutes=self.estimate_minutes)
+            estimate_text = translate(
+                self.language, "estimate_label", minutes=self.estimate_minutes
+            )
         else:
             over_min = (elapsed - est_seconds + 59) // 60
-            text = translate(self.language, "estimate_over_label", minutes=over_min)
-        return text, color
+            estimate_text = translate(self.language, "estimate_over_label", minutes=over_min)
+        return f"{elapsed_label} · {estimate_text}", color

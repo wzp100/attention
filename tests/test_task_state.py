@@ -21,7 +21,8 @@ def test_start_and_elapsed(state: TaskState) -> None:
     assert state.text_color != ""
     time_text = state.time_text()
     assert translate(state.language, "time_started") in time_text
-    assert "Elapsed" in time_text
+    est_text, _ = state.estimate_text()
+    assert "Elapsed" in est_text
 
 
 def test_pause_and_resume(state: TaskState, monkeypatch: pytest.MonkeyPatch) -> None:

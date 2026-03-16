@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -59,6 +61,10 @@ class TaskApp(QtWidgetBase):
             ) from _IMPORT_ERROR
         self.qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         super().__init__()
+        self._app_icon = self._load_app_icon()
+        if not self._app_icon.isNull():
+            self.qt_app.setWindowIcon(self._app_icon)
+            self.setWindowIcon(self._app_icon)
         self.config_path = config_path
         language = ensure_language(config.language, DEFAULT_LANGUAGE)
         self.state = TaskState(
@@ -160,7 +166,27 @@ class TaskApp(QtWidgetBase):
         apply_outline_effect(self._time_label, self.state.outline_color)
         apply_outline_effect(self._estimate_label, self.state.outline_color)
 
+    def _should_autostart(self) -> bool:
+        message = self.state.message.strip()
+        if not message:
+            return False
+        if message == DEFAULT_MESSAGE:
+            return False
+        if message in NO_TASK_VALUES:
+            return False
+        return True
+
+    def _autostart_if_needed(self) -> None:
+        if self.state.active or self.state.start_time is not None:
+            return
+        if not self._should_autostart():
+            return
+        self.state.start(self.state.message, self.state.estimate_minutes)
+        self.config.message = self.state.message
+        self.config.text_color = self.state.text_color
+
     def _refresh_labels(self) -> None:
+        self._autostart_if_needed()
         self._message_label.setText(self.state.message)
         message_palette = self._message_label.palette()
         message_palette.setColor(
@@ -179,20 +205,92 @@ class TaskApp(QtWidgetBase):
     # Context menu and tray
     def _build_tray_icon(self) -> QtWidgets.QSystemTrayIcon:
         tray = QtWidgets.QSystemTrayIcon(self)
-        pixmap = QtGui.QPixmap(64, 64)
-        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
-        painter = QtGui.QPainter(pixmap)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QtGui.QColor("#ff3b30"))
-        painter.setPen(QtGui.QPen(QtCore.Qt.GlobalColor.white, 2))
-        painter.drawEllipse(6, 6, 52, 52)
-        painter.drawText(pixmap.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "!\n!")
-        painter.end()
-        tray.setIcon(QtGui.QIcon(pixmap))
+        tray.setIcon(self._app_icon)
         tray.setToolTip(self.state.message)
         tray.activated.connect(self._handle_tray_activated)
         tray.setContextMenu(self._build_menu())
         return tray
+
+    def _load_app_icon(self) -> QtGui.QIcon:
+        icon_path = Path(__file__).resolve().parent.parent / "icon.png"
+        return QtGui.QIcon(str(icon_path))
+
+    def _autostart_supported(self) -> bool:
+        return sys.platform.startswith("win")
+
+    def _startup_folder(self) -> Path | None:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        return Path(appdata) / "Microsoft/Windows/Start Menu/Programs/Startup"
+
+    def _autostart_script_path(self) -> Path | None:
+        startup_folder = self._startup_folder()
+        if startup_folder is None:
+            return None
+        return startup_folder / "attention_autostart.bat"
+
+    def _is_autostart_enabled(self) -> bool:
+        if not self._autostart_supported():
+            return False
+        script_path = self._autostart_script_path()
+        return script_path is not None and script_path.exists()
+
+    def _resolve_python_executable(self) -> Path:
+        python_exe = Path(sys.executable)
+        if python_exe.name.lower() == "python.exe":
+            pythonw_exe = python_exe.with_name("pythonw.exe")
+            if pythonw_exe.exists():
+                return pythonw_exe
+        return python_exe
+
+    def _resolve_autostart_command_parts(self) -> list[str] | None:
+        if getattr(sys, "frozen", False):
+            return [str(Path(sys.executable))]
+        script_path = Path(sys.argv[0]).resolve()
+        if not script_path.exists() or script_path.is_dir():
+            fallback = Path(__file__).resolve().parent.parent / "floating_task.py"
+            if fallback.exists():
+                script_path = fallback
+            else:
+                return None
+        python_exe = self._resolve_python_executable()
+        return [str(python_exe), str(script_path)]
+
+    def _build_autostart_command(self) -> str | None:
+        parts = self._resolve_autostart_command_parts()
+        if not parts:
+            return None
+        parts.extend(["--config", str(self.config_path.resolve())])
+        return subprocess.list2cmdline(parts)
+
+    def _set_autostart(self, enabled: bool) -> bool:
+        if not self._autostart_supported():
+            return False
+        script_path = self._autostart_script_path()
+        if script_path is None:
+            return False
+        try:
+            if enabled:
+                command = self._build_autostart_command()
+                if not command:
+                    raise RuntimeError("Unable to determine launch command.")
+                script_path.parent.mkdir(parents=True, exist_ok=True)
+                script_path.write_text(
+                    "@echo off\n"
+                    f"start \"\" {command}\n",
+                    encoding="utf-8",
+                )
+            elif script_path.exists():
+                script_path.unlink()
+            return True
+        except (OSError, RuntimeError) as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("notice_title"),
+                self.tr("error_autostart", error=str(exc)),
+            )
+            return False
 
     def _handle_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
         if reason == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger:
@@ -214,10 +312,25 @@ class TaskApp(QtWidgetBase):
         schedule_action.triggered.connect(lambda: self._open_schedule_manager(self))
         history_action = menu.addAction(self.tr("menu_history"))
         history_action.triggered.connect(self.show_history)
+        autostart_action = menu.addAction(self.tr("tray_autostart"))
+        autostart_action.setCheckable(True)
+        autostart_action.setChecked(self._is_autostart_enabled())
+        autostart_action.triggered.connect(self._toggle_autostart)
+        if not self._autostart_supported():
+            autostart_action.setEnabled(False)
         menu.addSeparator()
         quit_action = menu.addAction(self.tr("tray_quit"))
         quit_action.triggered.connect(QtWidgets.QApplication.quit)
         return menu
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        if not self._set_autostart(checked):
+            action = self.sender()
+            if isinstance(action, QtGui.QAction):
+                action.setChecked(self._is_autostart_enabled())
+            return
+        self.config.autostart = checked
+        self._persist_config()
 
     def _show_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = self._build_menu()
