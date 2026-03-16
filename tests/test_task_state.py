@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta
-
 from datetime import timedelta
 
 import pytest
@@ -53,3 +51,15 @@ def test_estimate_color_ranges(state: TaskState, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(state, "elapsed_seconds", lambda: 61)
     text, color = state.estimate_text()
     assert color in {"#ff9800", "#ff3b30", "#ffeb3b"}
+
+
+def test_store_and_restore_task_snapshot(state: TaskState) -> None:
+    state.start("Deep Work", estimate_minutes=45)
+    snapshot = state.to_stored_task("task-1")
+
+    restored = TaskState(language="en")
+    restored.load_stored_task(snapshot)
+
+    assert restored.task_name() == "Deep Work"
+    assert restored.active is True
+    assert restored.estimate_minutes == 45

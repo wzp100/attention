@@ -38,13 +38,7 @@ def run_app(argv: list[str]) -> None:
     if args.text is not None:
         session_text = args.text.strip()
         if session_text:
-            original_message = config.message
-            app.state.message = session_text
-            if not args.no_persist:
-                app.config.message = session_text
-                app._persist_config()
-            else:
-                app.config.message = original_message
+            app.apply_session_text(session_text, persist=not args.no_persist)
         else:
             from PyQt6 import QtWidgets
 

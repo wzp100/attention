@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
+from uuid import uuid4
 
 from .constants import (
     ACTIVE_TEXT_COLOR,
@@ -17,7 +18,30 @@ from .constants import (
     STOP_TEXT_COLOR,
     TIME_TEXT_COLOR,
 )
-from .i18n import translate
+from .i18n import strip_pause_prefix, translate
+
+
+@dataclass
+class StoredTask:
+    """Serializable task snapshot used for task switching and persistence."""
+
+    title: str
+    id: str = field(default_factory=lambda: uuid4().hex)
+    estimate_minutes: Optional[int] = None
+    active: bool = False
+    paused: bool = False
+    start_time: Optional[datetime] = None
+    elapsed_before_pause_seconds: int = 0
+    text_color: str = STOP_TEXT_COLOR
+
+    def display_message(self, language: str) -> str:
+        title = self.title.strip()
+        if not title:
+            return translate(language, "no_task")
+        if self.paused:
+            prefix = translate(language, "pause_prefix")
+            return f"{prefix} {title}"
+        return title
 
 
 @dataclass
@@ -36,6 +60,9 @@ class TaskState:
     paused: bool = False
     start_time: Optional[datetime] = None
     elapsed_before_pause: timedelta = field(default_factory=timedelta)
+
+    def task_name(self) -> str:
+        return strip_pause_prefix(self.message).strip()
 
     def start(self, task_name: str, estimate_minutes: Optional[int] = None) -> None:
         task_name = task_name.strip()
@@ -57,17 +84,14 @@ class TaskState:
         self.paused = True
         self.text_color = PAUSE_TEXT_COLOR
         prefix = translate(self.language, "pause_prefix")
-        if not self.message.startswith(prefix):
-            self.message = f"{prefix} {self.message}"
+        self.message = f"{prefix} {self.task_name()}"
 
     def resume(self) -> None:
         if not self.active or not self.paused:
             return
         self.paused = False
         self.text_color = ACTIVE_TEXT_COLOR
-        prefix = translate(self.language, "pause_prefix")
-        if self.message.startswith(prefix):
-            self.message = self.message[len(prefix) :].lstrip()
+        self.message = self.task_name()
         self.start_time = datetime.now()
 
     def stop(self) -> None:
@@ -78,6 +102,38 @@ class TaskState:
         self.message = translate(self.language, "no_task")
         self.text_color = STOP_TEXT_COLOR
         self.estimate_minutes = None
+
+    def load_stored_task(self, task: StoredTask | None) -> None:
+        if task is None:
+            self.active = False
+            self.paused = False
+            self.start_time = None
+            self.elapsed_before_pause = timedelta()
+            self.estimate_minutes = None
+            self.text_color = STOP_TEXT_COLOR
+            self.message = translate(self.language, "no_task")
+            return
+        self.estimate_minutes = task.estimate_minutes
+        self.active = task.active
+        self.paused = task.paused
+        self.start_time = task.start_time
+        self.elapsed_before_pause = timedelta(seconds=task.elapsed_before_pause_seconds)
+        self.text_color = task.text_color or STOP_TEXT_COLOR
+        self.message = task.display_message(self.language)
+
+    def to_stored_task(self, task_id: str) -> StoredTask:
+        return StoredTask(
+            id=task_id,
+            title=self.task_name(),
+            estimate_minutes=self.estimate_minutes,
+            active=self.active,
+            paused=self.paused,
+            start_time=self.start_time,
+            elapsed_before_pause_seconds=max(
+                0, int(self.elapsed_before_pause.total_seconds())
+            ),
+            text_color=self.text_color,
+        )
 
     def elapsed_seconds(self) -> int:
         elapsed = self.elapsed_before_pause
